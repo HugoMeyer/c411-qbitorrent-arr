@@ -1,0 +1,610 @@
+(() => {
+  const MARK = 'data-qbt-injected';
+  const ARM_TIMEOUT_MS = 20000;
+  let armTimer = null;
+
+  const norm = (el) => (el.textContent || '').replace(/\s+/g, ' ').trim();
+
+  function send(msg) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage(msg, (res) => {
+          if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+          else resolve(res || { ok: false, error: 'Pas de réponse' });
+        });
+      } catch (e) {
+        resolve({ ok: false, error: 'Extension mise à jour : recharge la page (F5).' });
+      }
+    });
+  }
+
+  function toast(text, isError = false) {
+    let box = document.getElementById('qbt-toasts');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'qbt-toasts';
+      Object.assign(box.style, {
+        position: 'fixed', bottom: '20px', right: '20px', zIndex: 2147483647,
+        display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'flex-end'
+      });
+      document.body.appendChild(box);
+    }
+    const el = document.createElement('div');
+    el.textContent = text;
+    Object.assign(el.style, {
+      padding: '12px 16px', borderRadius: '8px', font: '14px system-ui, sans-serif',
+      color: '#fff', background: isError ? '#c0392b' : '#27ae60',
+      boxShadow: '0 4px 16px rgba(0,0,0,.3)', maxWidth: '400px'
+    });
+    box.appendChild(el);
+    setTimeout(() => el.remove(), isError ? 8000 : 5000);
+  }
+
+  function detectMedia() {
+    const label = [...document.querySelectorAll('span')].find((s) => norm(s) === 'Fiches :');
+    let links = label ? [...label.parentElement.querySelectorAll('a[href]')] : [];
+    if (!links.length) links = [...document.querySelectorAll('a[href]')];
+
+    const ids = {};
+    for (const a of links) {
+      const href = a.href;
+      let m;
+      if (!ids.imdb && (m = href.match(/imdb\.com\/title\/(tt\d+)/))) ids.imdb = m[1];
+      else if (!ids.tmdb && (m = href.match(/themoviedb\.org\/(movie|tv)\/(\d+)/))) { ids.tmdbKind = m[1]; ids.tmdb = m[2]; }
+      else if (!ids.tvdb && (m = href.match(/thetvdb\.com\/.*\bseries\/(\d+)/))) ids.tvdb = m[1];
+    }
+    const type = ids.tmdbKind === 'tv' || ids.tvdb ? 'series' : ids.tmdbKind === 'movie' ? 'movie' : '';
+    return { type, ids, fromFiches: !!label, seasons: type === 'series' ? detectSeasons() : [] };
+  }
+
+  function pageTitle() {
+    const h1 = document.querySelector('h1');
+    return h1 ? norm(h1) : document.title;
+  }
+
+  // "S01", "S02E05", "S01-S03" → [1], [2], [1, 2, 3]. Complete packs without Sxx → [].
+  function detectSeasons(title = pageTitle()) {
+    const found = new Set();
+    for (const m of title.matchAll(/S(\d{1,2})\s*-\s*S(\d{1,2})(?![0-9])/gi)) {
+      const [a, b] = [Number(m[1]), Number(m[2])].sort((x, y) => x - y);
+      if (b - a <= 50) for (let n = a; n <= b; n++) found.add(n);
+    }
+    for (const m of title.matchAll(/(?:^|[^A-Za-z0-9])S(\d{1,2})(?=E\d|[^A-Za-z0-9]|$)/g)) found.add(Number(m[1]));
+    return [...found].sort((a, b) => a - b);
+  }
+
+  const pageHashFromUrl = () => {
+    const m = location.pathname.match(/\/torrents\/([a-f0-9]{40})\b/i);
+    return m ? m[1].toLowerCase() : '';
+  };
+
+  function detectHash() {
+    const fromUrl = pageHashFromUrl();
+    if (fromUrl) return fromUrl;
+    const label = [...document.querySelectorAll('span, div, dt, p')].find((el) => /^Hash\s*:?$/i.test(norm(el)));
+    const scope = label ? label.parentElement : document.body;
+    const m = (scope.textContent || '').match(/\b([a-f0-9]{40})\b/i);
+    return m ? m[1].toLowerCase() : '';
+  }
+
+  // ---------- Status badge (duplicates / library) ----------
+
+  let badge = null;
+  let lastStatus = null;
+  let statusKey = '';
+  let statusRequest = 0;
+
+  function badgeEl() {
+    const ours = document.querySelector(`button[${MARK}="ours"]`);
+    if (!ours) return null;
+    if (!badge) {
+      badge = document.createElement('span');
+      Object.assign(badge.style, {
+        display: 'inline-flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center',
+        marginLeft: '0.5rem', font: '12px system-ui, sans-serif', verticalAlign: 'middle'
+      });
+    }
+    if (badge.previousElementSibling !== ours) ours.insertAdjacentElement('afterend', badge);
+    return badge;
+  }
+
+  function pill(text, color, title) {
+    const el = document.createElement('span');
+    el.textContent = text;
+    if (title) el.title = title;
+    Object.assign(el.style, {
+      padding: '3px 8px', borderRadius: '999px', whiteSpace: 'nowrap',
+      background: color + '26', color, border: `1px solid ${color}66`
+    });
+    return el;
+  }
+
+  const QB_STATES = {
+    downloading: 'téléchargement', stalledDL: 'en attente', metaDL: 'métadonnées', forcedDL: 'téléchargement',
+    queuedDL: 'en file', pausedDL: 'en pause', stoppedDL: 'en pause', checkingDL: 'vérification',
+    uploading: 'seed', stalledUP: 'seed', forcedUP: 'seed', queuedUP: 'seed (file)', pausedUP: 'terminé',
+    stoppedUP: 'terminé', checkingUP: 'vérification', error: 'erreur', missingFiles: 'fichiers manquants'
+  };
+
+  function qbitText(q) {
+    const pct = Math.floor((q.progress || 0) * 100);
+    return `qBittorrent : ${pct >= 100 ? 'complet' : pct + ' %'} · ${QB_STATES[q.state] || q.state}`;
+  }
+
+  function renderBadge() {
+    const el = badgeEl();
+    if (!el) return;
+    el.replaceChildren();
+    const s = lastStatus;
+    if (!s) return;
+    if (s.qbit) el.append(pill('⚠ ' + qbitText(s.qbit), '#f59e0b', s.qbit.name + (s.qbit.category ? ` — catégorie : ${s.qbit.category}` : '')));
+    const lib = s.library;
+    if (!lib) return;
+    if (!lib.inLibrary) { el.append(pill(`Pas dans ${lib.service}`, '#9ca3af')); return; }
+    if (lib.service === 'Radarr') {
+      el.append(pill(lib.hasFile ? '✔ Radarr : fichier présent' : 'Radarr : fichier manquant',
+        lib.hasFile ? '#22c55e' : '#3b82f6', lib.title));
+      return;
+    }
+    if (lib.seasons && lib.seasons.length) {
+      for (const se of lib.seasons) {
+        const name = 'S' + String(se.number).padStart(2, '0');
+        if (!se.exists) { el.append(pill(`Sonarr : ${name} inconnue`, '#9ca3af', lib.title)); continue; }
+        const complete = se.total > 0 && se.files >= se.total;
+        el.append(pill(`${complete ? '✔ ' : ''}Sonarr ${name} : ${se.files}/${se.total} ép.`,
+          complete ? '#22c55e' : '#3b82f6', lib.title));
+      }
+    } else {
+      el.append(pill(`Sonarr : ${lib.files}/${lib.total} ép.`, '#3b82f6', lib.title));
+    }
+  }
+
+  async function refreshStatus(force = false) {
+    if (!document.querySelector(`button[${MARK}="ours"]`)) return;
+    const media = detectMedia();
+    const hash = detectHash();
+    const useMedia = media.fromFiches && media.type;
+    const key = [location.pathname, hash, useMedia ? JSON.stringify(media) : ''].join('|');
+    if (!force && key === statusKey) { renderBadge(); return; }
+    statusKey = key;
+    lastStatus = null;
+    renderBadge();
+    if (!hash && !useMedia) return;
+    const reqId = ++statusRequest;
+    const res = await send({ type: 'pageStatus', hash, media: useMedia ? media : null });
+    if (reqId !== statusRequest || !res.ok) return;
+    lastStatus = res;
+    renderBadge();
+  }
+
+  // ctx (list rows): { name, qbit } — no Radarr/Sonarr IDs are available outside the torrent page.
+  function chooseCategory(ctx = null) {
+    const listMode = !!ctx;
+    const detected = listMode ? { type: '', ids: {} } : detectMedia();
+    const knownQbit = listMode ? ctx.qbit : lastStatus && lastStatus.qbit;
+    const idsText = [
+      detected.ids.imdb && `IMDb ${detected.ids.imdb}`,
+      detected.ids.tmdb && `TMDB ${detected.ids.tmdb}`,
+      detected.ids.tvdb && `TVDB ${detected.ids.tvdb}`
+    ].filter(Boolean).join(' · ') || 'aucun ID trouvé';
+
+    return new Promise(async (resolve) => {
+      const host = document.createElement('div');
+      const root = host.attachShadow({ mode: 'closed' });
+      root.innerHTML = `
+        <style>
+          .bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 2147483646;
+                display: flex; align-items: center; justify-content: center; font: 14px system-ui, sans-serif; }
+          .box { background: #1e1e24; color: #eee; border-radius: 10px; padding: 20px; width: 340px;
+                 box-shadow: 0 10px 40px rgba(0,0,0,.5); }
+          h3 { margin: 0 0 14px; font-size: 16px; }
+          select { width: 100%; padding: 8px; border-radius: 6px; background: #2b2b33; color: #eee; border: 1px solid #444; }
+          label { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+          .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+          button { padding: 8px 14px; border-radius: 6px; border: 0; cursor: pointer; font-weight: 600; }
+          .ok { background: #3b82f6; color: #fff; } .ok:disabled { opacity: .5; cursor: default; }
+          .cancel { background: #3a3a44; color: #eee; }
+          .err { color: #ff7b72; margin-top: 10px; white-space: pre-wrap; }
+          .lbl { margin: 12px 0 4px; font-weight: 600; } .lbl:first-of-type { margin-top: 0; }
+          .ids { margin-top: 4px; font-size: 12px; color: #999; }
+          .warn { background: #f59e0b22; color: #fbbf24; border: 1px solid #f59e0b66; border-radius: 6px;
+                  padding: 8px 10px; margin-bottom: 12px; }
+          input[type=text] { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 6px;
+                  background: #2b2b33; color: #eee; border: 1px solid #444; }
+          .hint { font-size: 12px; color: #999; margin-top: 4px; }
+          .tname { font-size: 12px; color: #bbb; margin: -6px 0 12px; word-break: break-all; }
+          .listhint { margin: 0 0 4px; }
+        </style>
+        <div class="bg">
+          <div class="box">
+            <h3>Envoyer à qBittorrent</h3>
+            <div class="tname" hidden></div>
+            <div class="warn" hidden></div>
+            <div class="arrsel">
+            <div class="lbl">Ajouter à</div>
+            <select class="type">
+              <option value="">Ne pas ajouter</option>
+              <option value="movie">Radarr (film)</option>
+              <option value="series">Sonarr (série)</option>
+            </select>
+            <div class="ids">${idsText}</div>
+            </div>
+            <div class="ids listhint" hidden>Radarr/Sonarr : ouvre la fiche du torrent pour l’ajout automatique.</div>
+            <div class="arr" hidden>
+              <div class="lbl">Dossier racine</div>
+              <select class="root" disabled><option>Chargement…</option></select>
+              <div class="stype-wrap" hidden>
+                <div class="lbl">Type de série</div>
+                <select class="stype">
+                  <option value="standard">Standard</option>
+                  <option value="anime">Anime</option>
+                  <option value="daily">Quotidienne</option>
+                </select>
+              </div>
+            </div>
+            <div class="lbl">Catégorie qBittorrent</div>
+            <select class="cat" disabled><option>Chargement des catégories…</option></select>
+            <label><input type="checkbox" class="paused"> Ajouter en pause</label>
+            <div class="err" hidden></div>
+            <div class="row">
+              <button class="cancel">Annuler</button>
+              <button class="ok" disabled>Envoyer</button>
+            </div>
+          </div>
+        </div>`;
+      document.body.appendChild(host);
+
+      const select = root.querySelector('.cat');
+      const typeSelect = root.querySelector('.type');
+      const rootSelect = root.querySelector('.root');
+      const stypeSelect = root.querySelector('.stype');
+      const arrBox = root.querySelector('.arr');
+      const warn = root.querySelector('.warn');
+      if (knownQbit) {
+        warn.hidden = false;
+        warn.textContent = `⚠ Ce torrent est déjà dans qBittorrent (${qbitText(knownQbit).replace('qBittorrent : ', '')}).`;
+      }
+      if (listMode) {
+        root.querySelector('.arrsel').hidden = true;
+        root.querySelector('.listhint').hidden = false;
+        if (ctx.name) { const n = root.querySelector('.tname'); n.hidden = false; n.textContent = ctx.name; }
+      }
+      const ok = root.querySelector('.ok');
+      const err = root.querySelector('.err');
+      const close = (value) => { host.remove(); resolve(value); };
+
+      root.querySelector('.cancel').onclick = () => close(null);
+      root.querySelector('.bg').onclick = (e) => { if (e.target.classList.contains('bg')) close(null); };
+      root.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(null); if (e.key === 'Enter' && !ok.disabled) ok.click(); });
+      ok.onclick = () => close({
+        category: select.value,
+        paused: root.querySelector('.paused').checked,
+        media: typeSelect.value ? {
+          type: typeSelect.value,
+          ids: detected.ids,
+          rootFolder: rootSelect.value,
+          seriesType: typeSelect.value === 'series' ? stypeSelect.value : undefined
+        } : null
+      });
+
+      const res = await send({ type: 'getCategories' });
+      if (!res.ok) {
+        select.innerHTML = '<option value="">(aucune catégorie)</option>';
+        err.hidden = false;
+        err.textContent = res.error + '\nVérifie les options de l’extension.';
+        return;
+      }
+      select.innerHTML = '';
+      select.add(new Option('(aucune catégorie)', ''));
+      for (const c of res.categories) select.add(new Option(c, c));
+      select.value = res.categories.includes(res.selected) ? res.selected : '';
+
+      for (const opt of typeSelect.options) {
+        if (opt.value && !res.arrEnabled[opt.value]) { opt.disabled = true; opt.textContent += ' — non configuré'; }
+      }
+      const hasIds = detected.ids.imdb || detected.ids.tmdb || detected.ids.tvdb;
+      typeSelect.value = hasIds && res.arrEnabled[detected.type] ? detected.type : '';
+      const applyTypeCategory = () => {
+        const cat = res.byType[typeSelect.value];
+        if (cat && res.categories.includes(cat)) select.value = cat;
+      };
+      const guessSeriesType = () => {
+        stypeSelect.value = /anim/i.test(rootSelect.value) ? 'anime' : 'standard';
+      };
+      rootSelect.onchange = guessSeriesType;
+      let rootsRequest = 0;
+      const loadRoots = async () => {
+        const kind = typeSelect.value;
+        arrBox.hidden = !kind;
+        root.querySelector('.stype-wrap').hidden = kind !== 'series';
+        if (!kind) { rootsRequest++; err.hidden = true; ok.disabled = false; return; }
+        const reqId = ++rootsRequest;
+        rootSelect.disabled = true;
+        ok.disabled = true;
+        rootSelect.innerHTML = '<option>Chargement…</option>';
+        const meta = await send({ type: 'arrMeta', service: kind === 'movie' ? 'radarr' : 'sonarr' });
+        if (reqId !== rootsRequest) return;
+        rootSelect.innerHTML = '';
+        if (!meta.ok || !meta.roots.length) {
+          err.hidden = false;
+          err.textContent = meta.ok ? 'Aucun dossier racine configuré.' : meta.error;
+          return;
+        }
+        err.hidden = true;
+        for (const r of meta.roots) rootSelect.add(new Option(r, r));
+        const def = res.defaultRoot[kind];
+        rootSelect.value = meta.roots.includes(def) ? def : meta.roots[0];
+        guessSeriesType();
+        rootSelect.disabled = false;
+        ok.disabled = false;
+      };
+      typeSelect.onchange = () => { applyTypeCategory(); loadRoots(); };
+      applyTypeCategory();
+
+      select.disabled = false;
+      ok.disabled = false;
+      ok.focus();
+      loadRoots();
+    });
+  }
+
+  function clickNormalDownloadIfOffered() {
+    const deadline = Date.now() + 5000;
+    const tryClick = () => {
+      const label = [...document.querySelectorAll('span, div, button, a')]
+        .find((el) => norm(el) === 'Téléchargement normal' && el.offsetParent !== null);
+      if (label) {
+        (label.closest('button, a, [role="menuitem"], [role="option"], [role="button"], li') || label).click();
+        return;
+      }
+      if (Date.now() < deadline) setTimeout(tryClick, 150);
+    };
+    setTimeout(tryClick, 150);
+  }
+
+  async function sendToQbit(nativeButton, ctx = null) {
+    const choice = await chooseCategory(ctx);
+    if (!choice) return;
+
+    const armed = await send({ type: 'arm', ...choice });
+    if (!armed.ok) return toast(armed.error, true);
+
+    clearTimeout(armTimer);
+    armTimer = setTimeout(() => {
+      send({ type: 'disarm' });
+      toast('Aucun téléchargement détecté. Réessaie.', true);
+    }, ARM_TIMEOUT_MS);
+
+    nativeButton.click();
+    clickNormalDownloadIfOffered();
+  }
+
+  async function handleTorrent({ url, filename, category, paused, media }) {
+    clearTimeout(armTimer);
+    try {
+      const res = await fetch(url, { credentials: 'include' });
+      if (!res.ok) throw new Error(`Téléchargement du .torrent impossible (${res.status})`);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      const head = new TextDecoder('latin1').decode(bytes.slice(0, 4096));
+      if (head[0] !== 'd' || !new TextDecoder('latin1').decode(bytes).includes('4:info')) {
+        throw new Error('Le fichier récupéré n’est pas un .torrent valide');
+      }
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      const up = await send({ type: 'upload', base64: btoa(bin), filename, category, paused, media });
+      if (!up.ok) throw new Error(up.error);
+      toast(`Envoyé à qBittorrent${category ? ` (catégorie : ${category})` : ''} ✔`);
+      if (up.arrResult) toast(`✔ ${up.arrResult}`);
+      if (up.arrError) toast(up.arrError, true);
+      setTimeout(() => { refreshStatus(true); qbIndex = null; refreshListBadges(); }, 1500);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }
+
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.type === 'fetchTorrent') handleTorrent(msg);
+  });
+
+  function inject() {
+    for (const btn of document.querySelectorAll('button')) {
+      if (btn.hasAttribute(MARK) || norm(btn) !== 'Télécharger') continue;
+      btn.setAttribute(MARK, '1');
+      const ours = btn.cloneNode(false);
+      ours.setAttribute(MARK, 'ours');
+      const icon = btn.querySelector('[data-slot="leadingIcon"], .iconify, svg');
+      if (icon) ours.append(icon.cloneNode(true));
+      ours.append(document.createTextNode(icon ? ' qBittorrent' : '⇩ qBittorrent'));
+      ours.title = 'Envoyer à qBittorrent';
+      ours.style.marginLeft = '0.5rem';
+      ours.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        sendToQbit(btn);
+      });
+      btn.insertAdjacentElement('afterend', ours);
+    }
+    injectListRows();
+  }
+
+  // ---------- qBittorrent button in result rows (after the download icon) ----------
+
+  const CELL = 'data-qbt-cell';
+  const gridToken = (el) => (el.className && typeof el.className === 'string'
+    ? (el.className.split(/\s+/).find((c) => c.startsWith('lg:grid-cols-[')) || '') : '');
+
+  // Adds a narrow column to every grid (rows + header) sharing this template, so columns stay aligned.
+  function widenGrids(token) {
+    const template = token.slice('lg:grid-cols-['.length, -1).replace(/_/g, ' ') + ' 28px';
+    for (const g of document.querySelectorAll('[class*="lg:grid-cols-["]')) {
+      if (gridToken(g) !== token || g.hasAttribute(CELL)) continue;
+      g.setAttribute(CELL, 'grid');
+      g.style.gridTemplateColumns = template;
+      if (!g.querySelector('button[aria-label="Télécharger"]')) {
+        const filler = document.createElement('span');
+        filler.setAttribute(CELL, 'filler');
+        g.append(filler);
+      }
+    }
+  }
+
+  function rowLink(row) {
+    const wrapping = row.closest('a[href*="/torrents/"]');
+    if (wrapping) return wrapping;
+    let el = row.parentElement;
+    for (let depth = 0; el && depth < 5; depth++, el = el.parentElement) {
+      const links = [...el.querySelectorAll('a[href*="/torrents/"]')]
+        .filter((a) => /\/torrents\/[^/?#]+/.test(a.getAttribute('href')));
+      const uniq = [...new Set(links.map((a) => a.getAttribute('href')))];
+      if (uniq.length === 1) return links.find((a) => norm(a)) || links[0];
+      if (uniq.length > 1) return null;
+    }
+    return null;
+  }
+
+  function injectListRows() {
+    for (const btn of document.querySelectorAll('button[aria-label="Télécharger"]')) {
+      if (btn.hasAttribute(MARK)) continue;
+      const row = btn.closest('[class*="lg:grid-cols-["]');
+      const token = row && gridToken(row);
+      if (!token) continue;
+      btn.setAttribute(MARK, 'list');
+      widenGrids(token);
+      const ours = btn.cloneNode(true);
+      ours.setAttribute(MARK, 'ours-list');
+      ours.removeAttribute('aria-label');
+      ours.removeAttribute('data-state');
+      ours.removeAttribute('data-grace-area-trigger');
+      ours.setAttribute('aria-label', 'Envoyer à qBittorrent');
+      ours.title = 'Envoyer à qBittorrent';
+      ours.style.color = '#60a5fa';
+      ours.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const a = rowLink(row);
+        let qbit = null;
+        if (a) {
+          const t = matchAnchor(a, await loadIndex());
+          if (t) qbit = { name: t.name, progress: t.progress, state: t.state };
+        }
+        sendToQbit(btn, { name: a ? norm(a) : '', qbit });
+      });
+      const cell = document.createElement('span');
+      cell.setAttribute(CELL, 'btn');
+      cell.className = 'flex justify-center';
+      cell.append(ours);
+      row.append(cell);
+    }
+  }
+
+  // ---------- List badges (search results, etc.) ----------
+
+  const PILL = 'data-qbt-pill';
+  const normName = (s) => (s || '').toLowerCase().replace(/\.torrent$/, '').replace(/[^a-z0-9]+/g, '');
+  let qbIndex = null; // { byName: Map, byHash: Map, at }
+
+  async function loadIndex() {
+    if (qbIndex && Date.now() - qbIndex.at < 30000) return qbIndex;
+    const res = await send({ type: 'qbitIndex' });
+    const torrents = res.ok ? res.torrents : [];
+    qbIndex = {
+      at: Date.now(),
+      byName: new Map(torrents.map((t) => [normName(t.name), t])),
+      byHash: new Map(torrents.map((t) => [t.hash, t]))
+    };
+    return qbIndex;
+  }
+
+  function matchAnchor(a, idx) {
+    const h = (a.getAttribute('href') || '').match(/[a-f0-9]{40}/i);
+    if (h && idx.byHash.has(h[0].toLowerCase())) return idx.byHash.get(h[0].toLowerCase());
+    const candidates = [a.title, norm(a)];
+    for (const el of a.querySelectorAll('*')) if (!el.children.length) candidates.push(el.textContent);
+    for (const c of candidates) {
+      const k = normName(c);
+      if (k.length >= 12 && idx.byName.has(k)) return idx.byName.get(k);
+    }
+    return null;
+  }
+
+  // Where to put the pill: next to the "copy file name" button of the result row, if any.
+  function pillSlots(a) {
+    let el = a;
+    for (let depth = 0; el && depth < 8; depth++, el = el.parentElement) {
+      const btns = el.querySelectorAll('button[aria-label="Copier le nom du fichier"]');
+      if (btns.length && btns.length <= 2) return [...btns].map((b) => ({ ref: b, where: 'beforebegin' }));
+      if (btns.length > 2) break;
+    }
+    // Card-like links (e.g. notifications): put it at the end of the last text line, inside the link.
+    const lines = a.querySelectorAll('p');
+    if (lines.length) return [{ ref: lines[lines.length - 1], where: 'beforeend' }];
+    return [{ ref: a, where: 'afterend' }];
+  }
+
+  function existingPillAt(ref, where) {
+    const el = where === 'beforebegin' ? ref.previousElementSibling
+      : where === 'beforeend' ? ref.lastElementChild
+        : ref.nextElementSibling;
+    return !!(el && el.hasAttribute(PILL));
+  }
+
+  const anchorPills = new WeakMap();
+
+  async function refreshListBadges() {
+    const idx = await loadIndex();
+    if (!idx.byName.size) return;
+    const onDetail = !!document.querySelector(`button[${MARK}="ours"]`);
+    const currentHash = pageHashFromUrl() || (onDetail ? detectHash() : '');
+    const h1 = onDetail ? document.querySelector('h1') : null;
+    const titleKey = h1 ? normName(h1.textContent) : '';
+    for (const a of document.querySelectorAll('a[href]')) {
+      if (a.closest(`[${PILL}]`) || a.closest('#qbt-toasts')) continue;
+      // The torrent of the current page is already shown next to the qBittorrent button.
+      const selfLink = currentHash && (a.getAttribute('href') || '').toLowerCase().includes(currentHash);
+      const hidden = !a.getClientRects().length;
+      if (selfLink || hidden) {
+        (anchorPills.get(a) || []).forEach((p) => p.remove());
+        anchorPills.delete(a);
+        continue;
+      }
+      let t = matchAnchor(a, idx);
+      if (t && ((currentHash && t.hash === currentHash) || (titleKey.length >= 12 && normName(t.name) === titleKey))) t = null;
+      let pills = (anchorPills.get(a) || []).filter((p) => p.isConnected);
+      if (!t) { pills.forEach((p) => p.remove()); anchorPills.delete(a); continue; }
+      const done = t.progress >= 1;
+      const text = done ? '✔ qBit' : `⇩ ${Math.floor(t.progress * 100)} %`;
+      if (!pills.length) {
+        pills = pillSlots(a)
+          .filter(({ ref, where }) => !existingPillAt(ref, where))
+          .map(({ ref, where }) => {
+            const p = pill(text, done ? '#22c55e' : '#3b82f6', `Déjà dans qBittorrent : ${t.name}`);
+            p.setAttribute(PILL, '');
+            Object.assign(p.style, { fontSize: '10px', padding: '1px 6px', flexShrink: '0', lineHeight: '1.4' });
+            if (where !== 'beforebegin') p.style.marginLeft = '6px';
+            if (where === 'beforeend') p.style.display = 'inline-block';
+            ref.insertAdjacentElement(where, p);
+            return p;
+          });
+        anchorPills.set(a, pills);
+      } else {
+        for (const p of pills) if (p.textContent !== text) p.textContent = text;
+      }
+    }
+  }
+
+  let refreshTimer = null;
+  const isOwnMutation = (m) =>
+    (badge && badge.contains(m.target)) ||
+    (m.target.nodeType === 1 && m.target.hasAttribute(PILL)) ||
+    [...m.addedNodes, ...m.removedNodes].every((n) => n.nodeType === 1 && n.hasAttribute(PILL));
+  new MutationObserver((mutations) => {
+    if (mutations.every(isOwnMutation)) return;
+    inject();
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => { refreshStatus(); refreshListBadges(); }, 600);
+  }).observe(document.documentElement, { childList: true, subtree: true });
+  setInterval(() => { if (!document.hidden) refreshListBadges(); }, 30000);
+  inject();
+  refreshStatus();
+  refreshListBadges();
+})();

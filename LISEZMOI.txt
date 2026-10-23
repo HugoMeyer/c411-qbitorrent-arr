@@ -1,0 +1,13 @@
+C411 -> qBittorrent (extension Chrome)
+
+Installation :
+1. Dezippe ce dossier quelque part ou il restera (ne pas le supprimer ensuite).
+2. Ouvre chrome://extensions et active le "Mode developpeur" (en haut a droite).
+3. Clique "Charger l'extension non empaquetee" et choisis le dossier c411-qbittorrent.
+4. Clic droit sur l'icone de l'extension > Options :
+   - qBittorrent : URL de la WebUI, utilisateur, mot de passe, puis "Tester".
+   - Radarr / Sonarr (facultatif) : URL + cle API (Parametres > General), puis "Tester".
+   Chrome demandera l'autorisation d'acceder a tes serveurs : accepte.
+5. Va sur C411 (F5 si la page etait deja ouverte) : un bouton "qBittorrent" apparait a cote de "Telecharger".
+
+Radarr/Sonarr : les films/series sont ajoutes NON surveilles, sans recherche automatique.

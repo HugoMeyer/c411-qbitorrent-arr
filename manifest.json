@@ -1,0 +1,62 @@
+{
+    "manifest_version":  3,
+    "name":  "C411 → qBittorrent",
+    "version":  "1.6.0",
+    "description":  "Envoie les torrents de C411 directement vers qBittorrent avec choix de la catégorie, et ajout à Radarr/Sonarr.",
+    "permissions":  [
+                        "storage",
+                        "downloads",
+                        "declarativeNetRequestWithHostAccess",
+                        "notifications",
+                        "alarms"
+                    ],
+    "host_permissions":  [
+                             "https://c411.org/*",
+                             "https://*.c411.org/*"
+                         ],
+    "optional_host_permissions":  [
+                                      "https://*/*",
+                                      "http://*/*"
+                                  ],
+    "background":  {
+                       "service_worker":  "background.js"
+                   },
+    "action":  {
+                   "default_title":  "C411 → qBittorrent",
+                   "default_popup":  "popup.html",
+                   "default_icon":  {
+                                        "16":  "icon16.png",
+                                        "48":  "icon48.png",
+                                        "128":  "icon128.png"
+                                    }
+               },
+    "options_page":  "options.html",
+    "content_scripts":  [
+                            {
+                                "matches":  [
+                                                "https://c411.org/*",
+                                                "https://*.c411.org/*"
+                                            ],
+                                "js":  [
+                                           "page-hook.js"
+                                       ],
+                                "run_at":  "document_start",
+                                "world":  "MAIN"
+                            },
+                            {
+                                "matches":  [
+                                                "https://c411.org/*",
+                                                "https://*.c411.org/*"
+                                            ],
+                                "js":  [
+                                           "content.js"
+                                       ],
+                                "run_at":  "document_idle"
+                            }
+                        ],
+    "icons":  {
+                  "16":  "icon16.png",
+                  "48":  "icon48.png",
+                  "128":  "icon128.png"
+              }
+}
