@@ -2,6 +2,7 @@ const DEFAULTS = {
   qbUrl: '', username: '', password: '', defaultCategory: '', lastCategory: '',
   radarrUrl: '', radarrKey: '', radarrRoot: '', radarrProfile: '', radarrCategory: '',
   sonarrUrl: '', sonarrKey: '', sonarrRoot: '', sonarrProfile: '', sonarrCategory: '',
+  lidarrUrl: '', lidarrKey: '', lidarrRoot: '', lidarrProfile: '', lidarrMetaProfile: '', lidarrCategory: 'lidarr',
   notifyEnabled: true, notifyAll: false, listBadges: true
 };
 const ARM_TIMEOUT_MS = 20000;
@@ -200,9 +201,9 @@ async function toggleTorrent(hash, pause) {
   if (!res.ok) throw new Error(`qBittorrent ${res.status}`);
 }
 
-// ---------- Radarr / Sonarr ----------
+// ---------- Radarr / Sonarr / Lidarr ----------
 
-const ARR_LABEL = { radarr: 'Radarr', sonarr: 'Sonarr' };
+const ARR_LABEL = { radarr: 'Radarr', sonarr: 'Sonarr', lidarr: 'Lidarr' };
 
 function arrErrorMessage(data) {
   if (Array.isArray(data)) return data.map((e) => e.errorMessage || e.message || JSON.stringify(e)).join(' ; ');
@@ -215,7 +216,7 @@ async function arr(service, path, opts = {}, cfgOverride) {
   const base = (cfg[service + 'Url'] || '').trim().replace(/\/+$/, '');
   const key = (cfg[service + 'Key'] || '').trim();
   if (!base || !key) throw new Error(`${ARR_LABEL[service]} n’est pas configuré`);
-  const res = await fetch(base + '/api/v3' + path, {
+  const res = await fetch(base + (service === 'lidarr' ? '/api/v1' : '/api/v3') + path, {
     ...opts,
     headers: { 'X-Api-Key': key, 'Content-Type': 'application/json' }
   });
@@ -227,14 +228,17 @@ async function arr(service, path, opts = {}, cfgOverride) {
 }
 
 async function arrMeta(service, cfg) {
-  const [profiles, roots] = await Promise.all([
+  const [profiles, roots, metaProfiles] = await Promise.all([
     arr(service, '/qualityprofile', {}, cfg),
-    arr(service, '/rootfolder', {}, cfg)
+    arr(service, '/rootfolder', {}, cfg),
+    service === 'lidarr' ? arr(service, '/metadataprofile', {}, cfg) : null
   ]);
-  return {
+  const out = {
     profiles: profiles.map((p) => ({ id: p.id, name: p.name })),
     roots: roots.map((r) => r.path)
   };
+  if (metaProfiles) out.metaProfiles = metaProfiles.map((p) => ({ id: p.id, name: p.name }));
+  return out;
 }
 
 const first = (x) => (Array.isArray(x) ? x[0] : x);
@@ -319,9 +323,158 @@ async function addSeries(ids, cfg, rootFolder, seriesType) {
   });
   return `ajouté à Sonarr, non surveillée (${series.title})`;
 }
+
+// ---------- Lidarr (music) ----------
+
+const MBID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const mbCache = new Map();
+const normTitle = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+  .replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
+const sameTitle = (a, b) => {
+  a = normTitle(a);
+  b = normTitle(b);
+  return !!a && !!b && (a === b || a.includes(b) || b.includes(a));
+};
+const mbArtistOf = (x) => ((((x && x['artist-credit']) || [])[0] || {}).artist || {}).id;
+const quote = (s) => '"' + String(s).replace(/["\\]/g, ' ') + '"';
+// A lookup may fail for one unknown ID (Lidarr metadata server): try the next way, but never hide
+// a bad API key, a missing configuration or an unreachable server.
+const softFail = (fallback) => (e) => {
+  if (e instanceof TypeError || /^Lidarr (401|403) |n’est pas configuré/.test(e.message)) throw e;
+  return fallback;
+};
+
+// Public MusicBrainz API (CORS enabled); answers are kept while the service worker lives.
+function mbGet(path) {
+  if (!mbCache.has(path)) {
+    mbCache.set(path, fetch(`https://musicbrainz.org/ws/2/${path}${path.includes('?') ? '&' : '?'}fmt=json`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`MusicBrainz ${r.status}`))))
+      .catch((e) => { mbCache.delete(path); throw e; }));
+  }
+  return mbCache.get(path);
+}
+
+// C411 links MusicBrainz releases; Lidarr works with release groups. Without IDs: MusicBrainz search.
+async function musicIds(media) {
+  const ids = { ...(media.ids || {}) };
+  if (MBID.test(ids.mbRelease || '') && !ids.mbReleaseGroup) {
+    const r = await mbGet(`release/${ids.mbRelease}?inc=release-groups+artist-credits`).catch(() => null);
+    if (r && r['release-group']) {
+      ids.mbReleaseGroup = r['release-group'].id;
+      ids.mbArtist = ids.mbArtist || mbArtistOf(r);
+    }
+  }
+  if (!ids.mbReleaseGroup && media.album && media.lmode !== 'artist') {
+    const q = 'releasegroup:' + quote(media.album) + (media.artist ? ' AND artist:' + quote(media.artist) : '');
+    const r = await mbGet(`release-group?limit=10&query=${encodeURIComponent(q)}`).catch(() => null);
+    const rg = r && (r['release-groups'] || []).find((g) => g.score >= 80 && normTitle(g.title) === normTitle(media.album));
+    if (rg) {
+      ids.mbReleaseGroup = rg.id;
+      ids.mbArtist = ids.mbArtist || mbArtistOf(rg);
+    }
+  }
+  return ids;
+}
+
+async function lidarrFindArtist(mbArtist, name) {
+  if (MBID.test(mbArtist || '')) {
+    const a = asList(await arr('lidarr', `/artist?mbId=${mbArtist}`)).find((x) => x.foreignArtistId === mbArtist);
+    if (a || !name) return a || null;
+  }
+  if (!name) return null;
+  return asList(await arr('lidarr', '/artist')).find((x) => normTitle(x.artistName) === normTitle(name)) || null;
+}
+
+async function lidarrLookupArtist(media, ids) {
+  if (MBID.test(ids.mbArtist || '')) {
+    const a = first(await arr('lidarr', `/artist/lookup?term=${encodeURIComponent('lidarr:' + ids.mbArtist)}`).catch(softFail(null)));
+    if (a && a.foreignArtistId) return a;
+  }
+  if (!media.artist) return null;
+  const list = asList(await arr('lidarr', `/artist/lookup?term=${encodeURIComponent(media.artist)}`).catch(softFail([])));
+  return list.find((a) => normTitle(a.artistName) === normTitle(media.artist)) || null;
+}
+
+async function lidarrLookupAlbum(media, ids) {
+  for (const id of [ids.mbReleaseGroup, ids.mbRelease]) {
+    if (!MBID.test(id || '')) continue;
+    const a = first(await arr('lidarr', `/album/lookup?term=${encodeURIComponent('lidarr:' + id)}`).catch(softFail(null)));
+    if (a && a.foreignAlbumId) return a;
+  }
+  if (!media.album) return null;
+  const artistOk = (x) => !media.artist || (x.artist && ((ids.mbArtist && x.artist.foreignArtistId === ids.mbArtist) ||
+    sameTitle(x.artist.artistName, media.artist)));
+  for (const term of [[media.artist, media.album].filter(Boolean).join(' '), media.album]) {
+    const list = asList(await arr('lidarr', `/album/lookup?term=${encodeURIComponent(term)}`).catch(softFail([])));
+    const a = list.find((x) => sameTitle(x.title, media.album) && artistOk(x));
+    if (a) return a;
+  }
+  return null;
+}
+
+// Root folder + profiles: options first, then the root folder defaults. "None" = only manually added albums.
+async function lidarrTarget(cfg, rootFolder, forArtist) {
+  const [roots, qps, mps] = (await Promise.all(['/rootfolder', '/qualityprofile', '/metadataprofile']
+    .map((p) => arr('lidarr', p, {}, cfg)))).map(asList);
+  const path = rootFolder || cfg.lidarrRoot || (roots[0] && roots[0].path);
+  if (!path) throw new Error('Lidarr : aucun dossier racine');
+  const rf = roots.find((r) => r.path === path) || {};
+  const pick = (list, ids, ok = () => true) => ids.map(Number).find((id) => list.some((p) => p.id === id && ok(p)));
+  const quality = pick(qps, [cfg.lidarrProfile, rf.defaultQualityProfileId, qps[0] && qps[0].id]);
+  const realMeta = mps.find((p) => p.name !== 'None');
+  const metadata = pick(mps, [cfg.lidarrMetaProfile, rf.defaultMetadataProfileId, realMeta && realMeta.id],
+    (p) => !forArtist || p.name !== 'None');
+  if (!quality || !metadata) throw new Error('Lidarr : profil qualité / métadonnées introuvable');
+  return { path, quality, metadata };
+}
+
+// Artists and albums are always added unmonitored, without any search.
+const lidarrArtistBody = (artist, t) => ({
+  ...artist,
+  qualityProfileId: t.quality,
+  metadataProfileId: t.metadata,
+  rootFolderPath: t.path,
+  monitored: false,
+  monitorNewItems: 'none',
+  albumFolder: true,
+  tags: [],
+  addOptions: { monitor: 'none', searchForMissingAlbums: false }
+});
+
+async function addMusic(media, cfg) {
+  const ids = await musicIds(media);
+  if (media.lmode === 'artist') {
+    let artist = await lidarrFindArtist(ids.mbArtist, media.artist);
+    if (!artist) artist = await lidarrLookupArtist(media, ids);
+    if (!artist) throw new Error('Lidarr : artiste introuvable');
+    if (artist.id) return `déjà dans Lidarr (${artist.artistName})`;
+    const t = await lidarrTarget(cfg, media.rootFolder, true);
+    await arr('lidarr', '/artist', { method: 'POST', body: JSON.stringify(lidarrArtistBody(artist, t)) });
+    return `artiste ajouté à Lidarr, non surveillé (${artist.artistName})`;
+  }
+  const album = await lidarrLookupAlbum(media, ids);
+  if (!album) throw new Error('Lidarr : album introuvable (corrige artiste / album, ou choisis « L’artiste seul »)');
+  const name = album.title + (album.artist && album.artist.artistName ? ` — ${album.artist.artistName}` : '');
+  if (album.id) return `déjà dans Lidarr (${name})`;
+  const inLib = asList(await arr('lidarr', `/album?foreignAlbumId=${album.foreignAlbumId}`))
+    .find((x) => x.foreignAlbumId === album.foreignAlbumId);
+  if (inLib) return `déjà dans Lidarr (${name})`;
+  let artist = album.artist || {};
+  if (!artist.id) {
+    artist = (await lidarrFindArtist(artist.foreignArtistId)) ||
+      lidarrArtistBody(artist, await lidarrTarget(cfg, media.rootFolder, false));
+  }
+  await arr('lidarr', '/album', {
+    method: 'POST',
+    body: JSON.stringify({ ...album, artist, monitored: false, anyReleaseOk: true, addOptions: { searchForNewAlbum: false } })
+  });
+  return `ajouté à Lidarr, non surveillé (${name})`;
+}
+
 async function addToArr(media) {
   if (!media || !media.type) return null;
   const cfg = await getConfig();
+  if (media.type === 'music') return addMusic(media, cfg);
   return media.type === 'movie'
     ? addMovie(media.ids, cfg, media.rootFolder)
     : addSeries(media.ids, cfg, media.rootFolder, media.seriesType);
@@ -367,6 +520,26 @@ async function seriesStatus(ids, seasons) {
   };
 }
 
+async function musicStatus(media) {
+  const ids = await musicIds(media);
+  let album = null;
+  let artist = null;
+  if (ids.mbReleaseGroup) {
+    album = asList(await arr('lidarr', `/album?foreignAlbumId=${ids.mbReleaseGroup}`))
+      .find((x) => x.foreignAlbumId === ids.mbReleaseGroup) || null;
+  }
+  if (!album) {
+    artist = await lidarrFindArtist(ids.mbArtist, media.artist);
+    if (artist && media.album) {
+      album = asList(await arr('lidarr', `/album?artistId=${artist.id}`))
+        .find((x) => normTitle(x.title) === normTitle(media.album)) || null;
+    }
+  }
+  if (!album) return artist ? { service: 'Lidarr', inLibrary: true, artistOnly: true, title: artist.artistName } : { service: 'Lidarr', inLibrary: false };
+  const st = album.statistics || {};
+  return { service: 'Lidarr', inLibrary: true, title: album.title, files: st.trackFileCount || 0, total: st.totalTrackCount || 0 };
+}
+
 async function pageStatus({ hash, media }) {
   const cfg = await getConfig();
   const [qbit, library] = await Promise.all([
@@ -375,6 +548,7 @@ async function pageStatus({ hash, media }) {
       if (!media || !media.type) return undefined;
       if (media.type === 'movie' && cfg.radarrUrl && cfg.radarrKey) return movieStatus(media.ids);
       if (media.type === 'series' && cfg.sonarrUrl && cfg.sonarrKey) return seriesStatus(media.ids, media.seasons || []);
+      if (media.type === 'music' && cfg.lidarrUrl && cfg.lidarrKey) return musicStatus(media);
       return undefined;
     })().catch(() => undefined)
   ]);
@@ -414,11 +588,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return {
           categories,
           selected: cfg.lastCategory || cfg.defaultCategory,
-          byType: { movie: cfg.radarrCategory, series: cfg.sonarrCategory },
-          defaultRoot: { movie: cfg.radarrRoot, series: cfg.sonarrRoot },
+          byType: { movie: cfg.radarrCategory, series: cfg.sonarrCategory, music: cfg.lidarrCategory },
+          defaultRoot: { movie: cfg.radarrRoot, series: cfg.sonarrRoot, music: cfg.lidarrRoot },
           arrEnabled: {
             movie: !!(cfg.radarrUrl && cfg.radarrKey),
-            series: !!(cfg.sonarrUrl && cfg.sonarrKey)
+            series: !!(cfg.sonarrUrl && cfg.sonarrKey),
+            music: !!(cfg.lidarrUrl && cfg.lidarrKey)
           }
         };
       }
@@ -447,7 +622,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         pending = null;
         return {};
       case 'upload': {
-        // Add to Radarr/Sonarr first so it already knows the item when the download completes.
+        // Add to Radarr/Sonarr/Lidarr first so it already knows the item when the download completes.
         let arrResult = null;
         let arrError = null;
         try { arrResult = await addToArr(msg.media); } catch (e) { arrError = e.message; }

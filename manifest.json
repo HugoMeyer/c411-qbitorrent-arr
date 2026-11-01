@@ -1,8 +1,8 @@
 {
     "manifest_version":  3,
     "name":  "C411 → qBittorrent",
-    "version":  "1.6.0",
-    "description":  "Envoie les torrents de C411 directement vers qBittorrent avec choix de la catégorie, et ajout à Radarr/Sonarr.",
+    "version":  "1.7.0",
+    "description":  "Envoie les torrents de C411 directement vers qBittorrent avec choix de la catégorie, et ajout à Radarr/Sonarr/Lidarr.",
     "permissions":  [
                         "storage",
                         "downloads",

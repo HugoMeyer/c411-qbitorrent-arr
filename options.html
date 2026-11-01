@@ -54,6 +54,18 @@
   </fieldset>
 
   <fieldset>
+    <legend>Lidarr (musique)</legend>
+    <label>URL <input id="lidarrUrl" placeholder="https://lidarr.example.com"></label>
+    <label>Clé API <input id="lidarrKey" type="password" autocomplete="off"></label>
+    <label>Profil qualité <select id="lidarrProfile"></select></label>
+    <label>Profil de métadonnées <small>(albums connus pour un nouvel artiste)</small><select id="lidarrMetaProfile"></select></label>
+    <label>Dossier racine par défaut <select id="lidarrRoot"></select></label>
+    <label>Catégorie qBittorrent pour la musique <select id="lidarrCategory" class="cat"><option value="">(aucune)</option></select></label>
+    <p><small>Les albums et artistes sont toujours ajoutés non surveillés, sans recherche. Le profil de métadonnées « None » ne garde que les albums ajoutés depuis C411.</small></p>
+    <button data-load="lidarr">Tester / charger Lidarr</button>
+  </fieldset>
+
+  <fieldset>
     <legend>Affichage &amp; notifications</legend>
     <label class="inline"><input type="checkbox" id="listBadges"> Badges « déjà dans qBittorrent » dans les listes C411</label>
     <label class="inline"><input type="checkbox" id="notifyEnabled"> Notifier quand un téléchargement envoyé par l’extension est terminé</label>

@@ -40,8 +40,51 @@
     setTimeout(() => el.remove(), isError ? 8000 : 5000);
   }
 
+  const MUSIC_SOURCES = ['Deezer', 'MusicBrainz', 'Discogs', 'NFO (partiel)'];
+
+  // C411 music card: purple border, album title in the h3, artist in p[title], MusicBrainz/Deezer/Discogs links.
+  function detectMusic() {
+    const card = [...document.querySelectorAll('div.border-l-purple-500')].find((d) => d.querySelector('h3') &&
+      [...d.querySelectorAll('span')].some((s) => MUSIC_SOURCES.includes(norm(s))));
+    if (!card) return null;
+    const h3 = card.querySelector('h3');
+    let album = [...h3.childNodes].filter((n) => n.nodeType === Node.TEXT_NODE).map((n) => n.textContent)
+      .join(' ').replace(/\s+/g, ' ').trim();
+    if (album === 'Album inconnu') album = '';
+    const year = ((h3.querySelector('span') || {}).textContent || '').match(/\b(19|20)\d{2}\b/);
+    const artistEl = [...card.querySelectorAll('p[title]')].find((p) => !/^Crédits/.test(norm(p)));
+    const ids = {};
+    const MB = { 'release-group': 'mbReleaseGroup', release: 'mbRelease', artist: 'mbArtist' };
+    for (const a of card.querySelectorAll('a[href]')) {
+      const href = a.href;
+      let m;
+      if ((m = href.match(/musicbrainz\.org\/(release-group|release|artist)\/([0-9a-f-]{36})/i))) ids[MB[m[1].toLowerCase()]] = m[2].toLowerCase();
+      else if ((m = href.match(/deezer\.com\/(?:[a-z]{2}\/)?album\/(\d+)/i))) ids.deezer = m[1];
+      else if ((m = href.match(/discogs\.com\/(?:[^?#]*\/)?release\/(\d+)/i))) ids.discogs = m[1];
+    }
+    return {
+      type: 'music', ids, fromCard: true, seasons: [], album, year: year ? year[0] : '',
+      artist: artistEl ? artistEl.getAttribute('title').trim() : ''
+    };
+  }
+
+  // Without a music card: "Artiste - Album (2001) [FLAC]" or scene style "Artiste-Album-WEB-2001-GROUPE".
+  function guessMusic(title = pageTitle()) {
+    const t = title.replace(/\[[^\]]*\]|\{[^}]*\}/g, ' ');
+    let parts = t.split(/\s+[-–—]\s+/);
+    if (parts.length < 2) parts = t.replace(/[._]/g, ' ').split('-');
+    const clean = (s) => (s || '').replace(/\(([^)]*)\)/g, (m, x) => (/^(19|20)\d{2}$/.test(x.trim()) ? ' ' : m))
+      .replace(/\s(19|20)\d{2}\b.*$/, '').replace(/\s+/g, ' ').trim();
+    const year = t.match(/\b(19|20)\d{2}\b/);
+    return { artist: clean(parts[0]), album: clean(parts[1]), year: year ? year[0] : '' };
+  }
+
   function detectMedia() {
     const label = [...document.querySelectorAll('span')].find((s) => norm(s) === 'Fiches :');
+    if (!label) {
+      const music = detectMusic();
+      if (music) return music;
+    }
     let links = label ? [...label.parentElement.querySelectorAll('a[href]')] : [];
     if (!links.length) links = [...document.querySelectorAll('a[href]')];
 
@@ -141,6 +184,15 @@
     const lib = s.library;
     if (!lib) return;
     if (!lib.inLibrary) { el.append(pill(`Pas dans ${lib.service}`, '#9ca3af')); return; }
+    if (lib.service === 'Lidarr') {
+      if (lib.artistOnly) el.append(pill('Lidarr : artiste présent, album absent', '#9ca3af', lib.title));
+      else if (!lib.total) el.append(pill('Lidarr : album présent', '#3b82f6', lib.title));
+      else {
+        const complete = lib.files >= lib.total;
+        el.append(pill(`${complete ? '✔ ' : ''}Lidarr : ${lib.files}/${lib.total} pistes`, complete ? '#22c55e' : '#3b82f6', lib.title));
+      }
+      return;
+    }
     if (lib.service === 'Radarr') {
       el.append(pill(lib.hasFile ? '✔ Radarr : fichier présent' : 'Radarr : fichier manquant',
         lib.hasFile ? '#22c55e' : '#3b82f6', lib.title));
@@ -163,7 +215,7 @@
     if (!document.querySelector(`button[${MARK}="ours"]`)) return;
     const media = detectMedia();
     const hash = detectHash();
-    const useMedia = media.fromFiches && media.type;
+    const useMedia = (media.fromFiches || media.fromCard) && media.type;
     const key = [location.pathname, hash, useMedia ? JSON.stringify(media) : ''].join('|');
     if (!force && key === statusKey) { renderBadge(); return; }
     statusKey = key;
@@ -177,7 +229,7 @@
     renderBadge();
   }
 
-  // ctx (list rows): { name, qbit } — no Radarr/Sonarr IDs are available outside the torrent page.
+  // ctx (list rows): { name, qbit } — no Radarr/Sonarr/Lidarr IDs are available outside the torrent page.
   function chooseCategory(ctx = null) {
     const listMode = !!ctx;
     const detected = listMode ? { type: '', ids: {} } : detectMedia();
@@ -185,7 +237,10 @@
     const idsText = [
       detected.ids.imdb && `IMDb ${detected.ids.imdb}`,
       detected.ids.tmdb && `TMDB ${detected.ids.tmdb}`,
-      detected.ids.tvdb && `TVDB ${detected.ids.tvdb}`
+      detected.ids.tvdb && `TVDB ${detected.ids.tvdb}`,
+      (detected.ids.mbRelease || detected.ids.mbReleaseGroup) && 'MusicBrainz',
+      detected.ids.deezer && `Deezer ${detected.ids.deezer}`,
+      detected.ids.discogs && `Discogs ${detected.ids.discogs}`
     ].filter(Boolean).join(' · ') || 'aucun ID trouvé';
 
     return new Promise(async (resolve) => {
@@ -196,7 +251,7 @@
           .bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 2147483646;
                 display: flex; align-items: center; justify-content: center; font: 14px system-ui, sans-serif; }
           .box { background: #1e1e24; color: #eee; border-radius: 10px; padding: 20px; width: 340px;
-                 box-shadow: 0 10px 40px rgba(0,0,0,.5); }
+                 max-height: 92vh; overflow-y: auto; box-shadow: 0 10px 40px rgba(0,0,0,.5); }
           h3 { margin: 0 0 14px; font-size: 16px; }
           select { width: 100%; padding: 8px; border-radius: 6px; background: #2b2b33; color: #eee; border: 1px solid #444; }
           label { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
@@ -226,10 +281,11 @@
               <option value="">Ne pas ajouter</option>
               <option value="movie">Radarr (film)</option>
               <option value="series">Sonarr (série)</option>
+              <option value="music">Lidarr (musique)</option>
             </select>
             <div class="ids">${idsText}</div>
             </div>
-            <div class="ids listhint" hidden>Radarr/Sonarr : ouvre la fiche du torrent pour l’ajout automatique.</div>
+            <div class="ids listhint" hidden>Radarr/Sonarr/Lidarr : ouvre la fiche du torrent pour l’ajout automatique.</div>
             <div class="arr" hidden>
               <div class="lbl">Dossier racine</div>
               <select class="root" disabled><option>Chargement…</option></select>
@@ -240,6 +296,19 @@
                   <option value="anime">Anime</option>
                   <option value="daily">Quotidienne</option>
                 </select>
+              </div>
+              <div class="music-wrap" hidden>
+                <div class="lbl">Ajouter dans Lidarr</div>
+                <select class="lmode">
+                  <option value="album">L’album (et l’artiste si besoin)</option>
+                  <option value="artist">L’artiste seul</option>
+                </select>
+                <div class="lbl">Artiste</div>
+                <input type="text" class="artist" placeholder="Nom de l’artiste">
+                <div class="album-wrap">
+                  <div class="lbl">Album</div>
+                  <input type="text" class="album" placeholder="Titre de l’album">
+                </div>
               </div>
             </div>
             <div class="lbl">Catégorie qBittorrent</div>
@@ -253,13 +322,34 @@
           </div>
         </div>`;
       document.body.appendChild(host);
+      // Typing in our fields must not trigger C411 keyboard shortcuts.
+      for (const t of ['keydown', 'keyup', 'keypress']) host.addEventListener(t, (e) => e.stopPropagation());
 
       const select = root.querySelector('.cat');
       const typeSelect = root.querySelector('.type');
       const rootSelect = root.querySelector('.root');
       const stypeSelect = root.querySelector('.stype');
+      const lmodeSelect = root.querySelector('.lmode');
+      const artistInput = root.querySelector('.artist');
+      const albumInput = root.querySelector('.album');
       const arrBox = root.querySelector('.arr');
       const warn = root.querySelector('.warn');
+      const SERVICE = { movie: 'radarr', series: 'sonarr', music: 'lidarr' };
+      const guess = detected.type === 'music' ? detected : guessMusic();
+      artistInput.value = guess.artist || '';
+      albumInput.value = guess.album || '';
+      lmodeSelect.onchange = () => { root.querySelector('.album-wrap').hidden = lmodeSelect.value === 'artist'; };
+      // Names edited by hand: the MusicBrainz IDs found on the page may no longer match.
+      const musicMedia = () => {
+        const artist = artistInput.value.trim();
+        const album = albumInput.value.trim();
+        const sameArtist = detected.type === 'music' && artist === (detected.artist || '');
+        const sameAlbum = sameArtist && album === (detected.album || '');
+        return {
+          type: 'music', artist, album, year: guess.year, rootFolder: rootSelect.value, lmode: lmodeSelect.value,
+          ids: sameAlbum ? detected.ids : sameArtist && detected.ids.mbArtist ? { mbArtist: detected.ids.mbArtist } : {}
+        };
+      };
       if (knownQbit) {
         warn.hidden = false;
         warn.textContent = `⚠ Ce torrent est déjà dans qBittorrent (${qbitText(knownQbit).replace('qBittorrent : ', '')}).`;
@@ -279,7 +369,7 @@
       ok.onclick = () => close({
         category: select.value,
         paused: root.querySelector('.paused').checked,
-        media: typeSelect.value ? {
+        media: typeSelect.value === 'music' ? musicMedia() : typeSelect.value ? {
           type: typeSelect.value,
           ids: detected.ids,
           rootFolder: rootSelect.value,
@@ -302,7 +392,7 @@
       for (const opt of typeSelect.options) {
         if (opt.value && !res.arrEnabled[opt.value]) { opt.disabled = true; opt.textContent += ' — non configuré'; }
       }
-      const hasIds = detected.ids.imdb || detected.ids.tmdb || detected.ids.tvdb;
+      const hasIds = detected.type === 'music' || detected.ids.imdb || detected.ids.tmdb || detected.ids.tvdb;
       typeSelect.value = hasIds && res.arrEnabled[detected.type] ? detected.type : '';
       const applyTypeCategory = () => {
         const cat = res.byType[typeSelect.value];
@@ -317,12 +407,13 @@
         const kind = typeSelect.value;
         arrBox.hidden = !kind;
         root.querySelector('.stype-wrap').hidden = kind !== 'series';
+        root.querySelector('.music-wrap').hidden = kind !== 'music';
         if (!kind) { rootsRequest++; err.hidden = true; ok.disabled = false; return; }
         const reqId = ++rootsRequest;
         rootSelect.disabled = true;
         ok.disabled = true;
         rootSelect.innerHTML = '<option>Chargement…</option>';
-        const meta = await send({ type: 'arrMeta', service: kind === 'movie' ? 'radarr' : 'sonarr' });
+        const meta = await send({ type: 'arrMeta', service: SERVICE[kind] });
         if (reqId !== rootsRequest) return;
         rootSelect.innerHTML = '';
         if (!meta.ok || !meta.roots.length) {
@@ -406,46 +497,82 @@
     if (msg.type === 'fetchTorrent') handleTorrent(msg);
   });
 
-  function inject() {
-    for (const btn of document.querySelectorAll('button')) {
-      if (btn.hasAttribute(MARK) || norm(btn) !== 'Télécharger') continue;
-      btn.setAttribute(MARK, '1');
-      const ours = btn.cloneNode(false);
-      ours.setAttribute(MARK, 'ours');
-      const icon = btn.querySelector('[data-slot="leadingIcon"], .iconify, svg');
-      if (icon) ours.append(icon.cloneNode(true));
-      ours.append(document.createTextNode(icon ? ' qBittorrent' : '⇩ qBittorrent'));
-      ours.title = 'Envoyer à qBittorrent';
-      ours.style.marginLeft = '0.5rem';
-      ours.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        sendToQbit(btn);
-      });
-      btn.insertAdjacentElement('afterend', ours);
-    }
-    injectListRows();
+  // ---------- qBittorrent buttons: torrent page, and right after each download icon in lists ----------
+
+  // Native download button -> our button. C411's own elements are never modified (Vue may re-render or
+  // reuse them); our button is recreated whenever it is no longer in the page.
+  const pairs = new Map();
+
+  function pairUp(native, make) {
+    const ours = pairs.get(native);
+    if (ours && ours.isConnected) return;
+    const el = make();
+    pairs.set(native, el);
+    native.insertAdjacentElement('afterend', el);
   }
 
-  // ---------- qBittorrent button in result rows (after the download icon) ----------
+  function sweepPairs() {
+    for (const [native, ours] of pairs) {
+      if (native.isConnected && ours.isConnected) continue;
+      if (!native.isConnected) ours.remove();
+      pairs.delete(native);
+    }
+  }
 
-  const CELL = 'data-qbt-cell';
-  const gridToken = (el) => (el.className && typeof el.className === 'string'
+  function pageButton(btn) {
+    const ours = btn.cloneNode(false);
+    ours.removeAttribute('id');
+    ours.setAttribute(MARK, 'ours');
+    const icon = btn.querySelector('[data-slot="leadingIcon"], .iconify, svg');
+    if (icon) ours.append(icon.cloneNode(true));
+    ours.append(document.createTextNode(icon ? ' qBittorrent' : '⇩ qBittorrent'));
+    ours.title = 'Envoyer à qBittorrent';
+    ours.style.marginLeft = '0.5rem';
+    ours.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      sendToQbit(btn);
+    });
+    return ours;
+  }
+
+  const gridToken = (el) => (typeof el.className === 'string'
     ? (el.className.split(/\s+/).find((c) => c.startsWith('lg:grid-cols-[')) || '') : '');
 
-  // Adds a narrow column to every grid (rows + header) sharing this template, so columns stay aligned.
-  function widenGrids(token) {
-    const template = token.slice('lg:grid-cols-['.length, -1).replace(/_/g, ' ') + ' 28px';
-    for (const g of document.querySelectorAll('[class*="lg:grid-cols-["]')) {
-      if (gridToken(g) !== token || g.hasAttribute(CELL)) continue;
-      g.setAttribute(CELL, 'grid');
-      g.style.gridTemplateColumns = template;
-      if (!g.querySelector('button[aria-label="Télécharger"]')) {
-        const filler = document.createElement('span');
-        filler.setAttribute(CELL, 'filler');
-        g.append(filler);
-      }
+  // Result rows are CSS grids whose columns come from a `lg:grid-cols-[…]` class. Only a few levels up
+  // are checked, so that a page-layout grid is never taken for a row.
+  function rowGrid(btn) {
+    let el = btn.parentElement;
+    for (let depth = 0; el && depth < 3; depth++, el = el.parentElement) if (gridToken(el)) return el;
+    return null;
+  }
+
+  // On desktop, the download-icon column (the last one) is doubled so that our icon fits next to C411's.
+  // The rule targets the class itself: rows and header sharing it stay aligned, rows added later are
+  // covered, and the mobile layout (below Tailwind's `lg` breakpoint) is left untouched.
+  const gridRules = new Map();
+
+  function widenColumn(token) {
+    if (gridRules.has(token)) return;
+    const cols = token.slice('lg:grid-cols-['.length, -1).split('_');
+    const last = /^(\d+(?:\.\d+)?)px$/.exec(cols[cols.length - 1]);
+    if (!last) { gridRules.set(token, ''); return; }
+    cols[cols.length - 1] = `${Number(last[1]) * 2}px`;
+    const sel = `.${CSS.escape(token)}`;
+    gridRules.set(token, `@media (min-width: 64rem) { ${sel}${sel} { grid-template-columns: ${cols.join(' ')}; } }`);
+  }
+
+  function applyGridRules() {
+    const css = [...gridRules.values()].filter(Boolean).join('\n');
+    if (!css) return;
+    let style = document.getElementById('qbt-style');
+    if (!style) {
+      style = document.createElement('style');
+      style.id = 'qbt-style';
+      style.setAttribute(MARK, 'style');
+      (document.head || document.documentElement).append(style);
     }
+    if (style.textContent !== css) style.textContent = css;
   }
 
   function rowLink(row) {
@@ -462,39 +589,49 @@
     return null;
   }
 
-  function injectListRows() {
-    for (const btn of document.querySelectorAll('button[aria-label="Télécharger"]')) {
+  function listButton(btn, row) {
+    const ours = btn.cloneNode(true);
+    for (const attr of ['id', 'data-state', 'data-grace-area-trigger']) ours.removeAttribute(attr);
+    ours.setAttribute(MARK, 'ours-list');
+    ours.setAttribute('aria-label', 'Envoyer à qBittorrent');
+    ours.title = 'Envoyer à qBittorrent';
+    ours.style.color = '#60a5fa';
+    ours.style.marginLeft = '2px';
+    ours.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const a = rowLink(row);
+      let qbit = null;
+      if (a) {
+        const t = matchAnchor(a, await loadIndex());
+        if (t) qbit = { name: t.name, progress: t.progress, state: t.state };
+      }
+      // innerText: only the layout shown at this screen size (rows hold both a desktop and a mobile one).
+      const name = a ? (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim() : '';
+      sendToQbit(btn, { name, qbit });
+    });
+    return ours;
+  }
+
+  const hasDownloadIcon = (btn) => !!btn.querySelector('[class*="arrow-down-tray"]');
+
+  function inject() {
+    sweepPairs();
+    for (const btn of document.querySelectorAll('button')) {
       if (btn.hasAttribute(MARK)) continue;
-      const row = btn.closest('[class*="lg:grid-cols-["]');
-      const token = row && gridToken(row);
-      if (!token) continue;
-      btn.setAttribute(MARK, 'list');
-      widenGrids(token);
-      const ours = btn.cloneNode(true);
-      ours.setAttribute(MARK, 'ours-list');
-      ours.removeAttribute('aria-label');
-      ours.removeAttribute('data-state');
-      ours.removeAttribute('data-grace-area-trigger');
-      ours.setAttribute('aria-label', 'Envoyer à qBittorrent');
-      ours.title = 'Envoyer à qBittorrent';
-      ours.style.color = '#60a5fa';
-      ours.addEventListener('click', async (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const a = rowLink(row);
-        let qbit = null;
-        if (a) {
-          const t = matchAnchor(a, await loadIndex());
-          if (t) qbit = { name: t.name, progress: t.progress, state: t.state };
-        }
-        sendToQbit(btn, { name: a ? norm(a) : '', qbit });
-      });
-      const cell = document.createElement('span');
-      cell.setAttribute(CELL, 'btn');
-      cell.className = 'flex justify-center';
-      cell.append(ours);
-      row.append(cell);
+      const text = norm(btn);
+      if (text === 'Télécharger') { pairUp(btn, () => pageButton(btn)); continue; }
+      if (text) continue;
+      const grid = rowGrid(btn);
+      const label = btn.getAttribute('aria-label');
+      // Desktop rows and search "media" rows label their download icon; the mobile result cards don't.
+      const listed = label === 'Télécharger'
+        || (label === null && !grid && hasDownloadIcon(btn) && !!btn.closest('a[href*="/torrents/"]'));
+      if (!listed) continue;
+      if (grid) widenColumn(gridToken(grid));
+      pairUp(btn, () => listButton(btn, grid || btn.parentElement));
     }
+    applyGridRules();
   }
 
   // ---------- List badges (search results, etc.) ----------
@@ -593,18 +730,32 @@
   }
 
   let refreshTimer = null;
-  const isOwnMutation = (m) =>
-    (badge && badge.contains(m.target)) ||
-    (m.target.nodeType === 1 && m.target.hasAttribute(PILL)) ||
-    [...m.addedNodes, ...m.removedNodes].every((n) => n.nodeType === 1 && n.hasAttribute(PILL));
-  new MutationObserver((mutations) => {
-    if (mutations.every(isOwnMutation)) return;
+  const isOwn = (n) => n.nodeType === 1 && (n.hasAttribute(PILL) || n.hasAttribute(MARK));
+  // The removal of one of our buttons (e.g. by a Vue re-render) is a page change: it must be put back.
+  const isOwnButton = (n) => n.nodeType === 1 && n.tagName === 'BUTTON' && n.hasAttribute(MARK);
+  const isOwnMutation = (m) => (badge && badge.contains(m.target)) || isOwn(m.target)
+    || ([...m.addedNodes, ...m.removedNodes].every(isOwn) && ![...m.removedNodes].some(isOwnButton));
+
+  // C411 is rendered by the server, then Vue "hydrates" it: nodes added before that are thrown away or
+  // reused by Vue (buttons lost after a reload). page-hook.js flags <html> once hydration is over.
+  function whenHydrated(start) {
+    const t0 = Date.now();
+    (function wait() {
+      if (document.documentElement.hasAttribute('data-qbt-hydrated') || Date.now() - t0 > 15000) start();
+      else setTimeout(wait, 100);
+    })();
+  }
+
+  whenHydrated(() => {
+    new MutationObserver((mutations) => {
+      if (mutations.every(isOwnMutation)) return;
+      inject();
+      clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => { refreshStatus(); refreshListBadges(); }, 600);
+    }).observe(document.documentElement, { childList: true, subtree: true });
+    setInterval(() => { if (!document.hidden) refreshListBadges(); }, 30000);
     inject();
-    clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => { refreshStatus(); refreshListBadges(); }, 600);
-  }).observe(document.documentElement, { childList: true, subtree: true });
-  setInterval(() => { if (!document.hidden) refreshListBadges(); }, 30000);
-  inject();
-  refreshStatus();
-  refreshListBadges();
+    refreshStatus();
+    refreshListBadges();
+  });
 })();
